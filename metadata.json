@@ -1,0 +1,6 @@
+{
+  "name": "Lost Quotes",
+  "description": "An exact clone of LostSamples for crate digging obscure quotes, dialogue snippets, and vinyl audio with a 16-pad chopper, step sequencer, and vintage FX rack.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
