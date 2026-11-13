@@ -18,6 +18,9 @@ export interface QuoteItem {
   sourceName: string;
   sourceUrl: string;
   youtubeId?: string;
+  archiveId?: string;
+  videoUrl?: string;
+  isLocalAudio?: boolean;
   category: Exclude<QuoteCategory, 'All Quotes'>;
   duration: number; // seconds
   tags: string[];

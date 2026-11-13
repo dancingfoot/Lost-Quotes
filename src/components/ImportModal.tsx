@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, Youtube, Archive, FileAudio, AlertCircle } from 'lucide-react';
 import { QuoteCategory, QuoteItem } from '../types';
 import { audioEngine } from '../utils/audioEngine';
+import { extractArchiveIdentifier, resolveArchiveMediaUrls } from '../utils/archiveFetcher';
 
 interface ImportModalProps {
   isOpen: boolean;
@@ -52,6 +53,10 @@ export const ImportModal: React.FC<ImportModalProps> = ({
 
     try {
       let ytId = '';
+      let archiveId = '';
+      let videoUrl: string | undefined;
+      let resolvedDuration = 24;
+
       if (activeTab === 'youtube') {
         if (!sourceUrl.trim()) {
           setError('Please enter a YouTube URL or 11-character video ID.');
@@ -59,10 +64,18 @@ export const ImportModal: React.FC<ImportModalProps> = ({
           return;
         }
         ytId = extractYoutubeId(sourceUrl) || sourceUrl.trim();
-      } else if (activeTab === 'archive' && !sourceUrl.trim()) {
-        setError('Please enter an Internet Archive item URL.');
-        setIsLoading(false);
-        return;
+      } else if (activeTab === 'archive') {
+        if (!sourceUrl.trim()) {
+          setError('Please enter an Internet Archive item URL or identifier.');
+          setIsLoading(false);
+          return;
+        }
+        archiveId = extractArchiveIdentifier(sourceUrl) || '';
+        if (archiveId) {
+          const media = await resolveArchiveMediaUrls(archiveId);
+          videoUrl = media.videoUrl;
+          if (media.duration) resolvedDuration = Math.min(180, media.duration);
+        }
       } else if (activeTab === 'file' && !uploadedFile) {
         setError('Please select an audio file to load.');
         setIsLoading(false);
@@ -90,8 +103,11 @@ export const ImportModal: React.FC<ImportModalProps> = ({
               : 'Local Audio File',
         sourceUrl: sourceUrl.trim() || 'https://archive.org',
         youtubeId: ytId || undefined,
+        archiveId: archiveId || undefined,
+        videoUrl,
+        isLocalAudio: activeTab === 'file',
         category,
-        duration: 24,
+        duration: resolvedDuration,
         tags: parsedTags.length > 0 ? parsedTags : ['Imported', category.replace(' Quotes', '')],
         quoteText:
           quoteText.trim() ||

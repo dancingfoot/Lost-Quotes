@@ -6,16 +6,97 @@ import {
   RotateCcw,
   Repeat,
   Bookmark,
-  Youtube,
   ExternalLink,
   Download,
   CircleDot,
   Upload,
   Share2,
   Check,
+  Volume2,
+  VolumeX,
+  Film,
+  Loader2,
 } from 'lucide-react';
 import { AudioFXState, LoopState, QuoteItem } from '../types';
 import { audioEngine } from '../utils/audioEngine';
+import { VolumeFader } from './VolumeFader';
+
+interface YTPlayerInstance {
+  playVideo: () => void;
+  pauseVideo: () => void;
+  seekTo: (seconds: number, allowSeekAhead: boolean) => void;
+  setPlaybackRate: (rate: number) => void;
+  setVolume: (volume: number) => void;
+  mute: () => void;
+  unMute: () => void;
+  getCurrentTime: () => number;
+  getDuration: () => number;
+  getPlayerState: () => number;
+  destroy: () => void;
+}
+
+interface YTGlobal {
+  Player: new (
+    el: HTMLElement | string,
+    opts: {
+      videoId: string;
+      playerVars?: Record<string, string | number>;
+      events?: {
+        onReady?: (e: { target: YTPlayerInstance }) => void;
+        onStateChange?: (e: { data: number; target: YTPlayerInstance }) => void;
+      };
+    }
+  ) => YTPlayerInstance;
+  PlayerState?: {
+    ENDED: number;
+    PLAYING: number;
+    PAUSED: number;
+  };
+}
+
+declare global {
+  interface Window {
+    YT?: YTGlobal;
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
+
+let ytApiPromise: Promise<YTGlobal> | null = null;
+
+const loadYouTubeIframeAPI = (): Promise<YTGlobal> => {
+  if (typeof window === 'undefined') {
+    return Promise.reject(new Error('No window'));
+  }
+  if (window.YT?.Player) {
+    return Promise.resolve(window.YT);
+  }
+  if (ytApiPromise) return ytApiPromise;
+
+  ytApiPromise = new Promise((resolve) => {
+    const existingReady = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      if (existingReady) existingReady();
+      if (window.YT) resolve(window.YT);
+    };
+
+    const existingScript = document.querySelector('script[src*="youtube.com/iframe_api"]');
+    if (!existingScript) {
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      tag.async = true;
+      document.head.appendChild(tag);
+    }
+  });
+
+  return ytApiPromise;
+};
+
+const snapYouTubeRate = (speed: number): number => {
+  const rates = [0.25, 0.5, 1, 1.25, 1.5, 2];
+  return rates.reduce((prev, curr) =>
+    Math.abs(curr - speed) < Math.abs(prev - speed) ? curr : prev
+  );
+};
 
 interface TapeDeckProps {
   quote: QuoteItem;
@@ -33,6 +114,8 @@ interface TapeDeckProps {
   isRecording: boolean;
   onToggleRecord: () => void;
   onOpenImport: () => void;
+  volume: number;
+  onChangeVolume: (vol: number) => void;
 }
 
 const formatTime = (sec: number): string => {
@@ -59,15 +142,26 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
   isRecording,
   onToggleRecord,
   onOpenImport,
+  volume,
+  onChangeVolume,
 }) => {
   const tapeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const overviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  const ytContainerRef = useRef<HTMLDivElement | null>(null);
+  const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
+  const ytReadyRef = useRef<boolean>(false);
+
+  const htmlVideoRef = useRef<HTMLVideoElement | null>(null);
+
   const [displayTime, setDisplayTime] = useState<number>(0);
   const [displayVel, setDisplayVel] = useState<number>(0);
   const [isScratching, setIsScratching] = useState<boolean>(false);
-  const [showVideo, setShowVideo] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [videoAudioEnabled, setVideoAudioEnabled] = useState<boolean>(true);
+  const [videoBuffering, setVideoBuffering] = useState<boolean>(false);
+  const [videoLoadFailed, setVideoLoadFailed] = useState<boolean>(false);
+  const [videoNaturalDuration, setVideoNaturalDuration] = useState<number>(0);
 
   const dragStateRef = useRef<{
     active: boolean;
@@ -75,12 +169,168 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
     lastTimeMs: number;
   }>({ active: false, lastX: 0, lastTimeMs: 0 });
 
-  const WINDOW_SECONDS = 8; // 8 seconds visible across scrolling tape window (4s behind, 4s ahead)
+  const WINDOW_SECONDS = 8;
 
-  // Reset video view when changing quote
+  const hasYouTube = Boolean(quote.youtubeId);
+  const hasDirectVideo = Boolean(quote.videoUrl) && !videoLoadFailed;
+  const hasArchiveEmbed = Boolean(quote.archiveId) && (!quote.videoUrl || videoLoadFailed);
+  const hasAnyVideo = hasYouTube || hasDirectVideo || hasArchiveEmbed;
+
+  // Reset per-quote video state when switching quote
   useEffect(() => {
-    setShowVideo(false);
-  }, [quote.id]);
+    setVideoLoadFailed(false);
+    setVideoBuffering(Boolean(quote.youtubeId || quote.videoUrl));
+    setVideoNaturalDuration(0);
+    ytReadyRef.current = false;
+  }, [quote.id, quote.youtubeId, quote.videoUrl]);
+
+  // Coordinate whether Video Player carries forward dialogue or Tape FX buffer runs solo
+  useEffect(() => {
+    const shouldVideoCarryAudio =
+      hasAnyVideo && !quote.isLocalAudio && videoAudioEnabled && !hasArchiveEmbed;
+    audioEngine.setVideoAudioActive(shouldVideoCarryAudio);
+  }, [hasAnyVideo, hasArchiveEmbed, quote.isLocalAudio, videoAudioEnabled]);
+
+  // Mount & manage YouTube IFrame Player whenever quote.youtubeId changes
+  useEffect(() => {
+    if (!quote.youtubeId) {
+      if (ytPlayerRef.current) {
+        try {
+          ytPlayerRef.current.destroy();
+        } catch {
+          // Ignore
+        }
+        ytPlayerRef.current = null;
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const container = ytContainerRef.current;
+    if (!container) return;
+
+    // Create fresh mount node inside container so YT.Player replacement never breaks React DOM
+    container.innerHTML = '';
+    const playerMount = document.createElement('div');
+    playerMount.className = 'w-full h-full';
+    container.appendChild(playerMount);
+
+    loadYouTubeIframeAPI()
+      .then((YT) => {
+        if (cancelled || !playerMount.isConnected) return;
+        const player = new YT.Player(playerMount, {
+          videoId: quote.youtubeId!,
+          playerVars: {
+            autoplay: 0,
+            controls: 1,
+            rel: 0,
+            modestbranding: 1,
+            playsinline: 1,
+            enablejsapi: 1,
+          },
+          events: {
+            onReady: (event) => {
+              if (cancelled) return;
+              ytReadyRef.current = true;
+              setVideoBuffering(false);
+              try {
+                const dur = event.target.getDuration();
+                if (dur > 1) setVideoNaturalDuration(dur);
+                event.target.setVolume(Math.round(volume * 100));
+                if (!videoAudioEnabled || volume === 0) event.target.mute();
+                else event.target.unMute();
+                event.target.setPlaybackRate(snapYouTubeRate(fx.speed));
+                if (isPlaying && !fx.reverse) {
+                  event.target.seekTo(audioEngine.getCurrentTime(), true);
+                  event.target.playVideo();
+                }
+              } catch {
+                // Ignore
+              }
+            },
+          },
+        });
+        ytPlayerRef.current = player;
+      })
+      .catch(() => {
+        if (!cancelled) setVideoBuffering(false);
+      });
+
+    return () => {
+      cancelled = true;
+      ytReadyRef.current = false;
+      if (ytPlayerRef.current) {
+        try {
+          ytPlayerRef.current.destroy();
+        } catch {
+          // Ignore
+        }
+        ytPlayerRef.current = null;
+      }
+    };
+    // Intentionally re-init YT player only when quote.youtubeId changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quote.youtubeId]);
+
+  // Sync Play/Pause, Speed, Volume, Mute, and Reverse with YouTube & HTML5 <video>
+  useEffect(() => {
+    const shouldPlayVideo = isPlaying && !isScratching && !fx.reverse;
+
+    // 1. YouTube Player sync
+    const yt = ytPlayerRef.current;
+    if (yt && ytReadyRef.current) {
+      try {
+        yt.setVolume(Math.round(volume * 100));
+        if (videoAudioEnabled && volume > 0) yt.unMute();
+        else yt.mute();
+        yt.setPlaybackRate(snapYouTubeRate(fx.speed));
+        if (shouldPlayVideo) {
+          yt.playVideo();
+        } else {
+          yt.pauseVideo();
+        }
+      } catch {
+        // Ignore YT transient errors
+      }
+    }
+
+    // 2. HTML5 Video (<video>) sync for Internet Archive MP4 streams
+    const vid = htmlVideoRef.current;
+    if (vid) {
+      vid.volume = Math.max(0, Math.min(1, volume));
+      vid.muted = !videoAudioEnabled || volume === 0;
+      vid.playbackRate = Math.max(0.25, Math.min(2.0, fx.speed));
+      if (shouldPlayVideo) {
+        vid.play().catch(() => {
+          // Browser autoplay policies handled gracefully
+        });
+      } else {
+        vid.pause();
+      }
+    }
+  }, [isPlaying, isScratching, fx.reverse, fx.speed, videoAudioEnabled, volume, quote.videoUrl]);
+
+  // Seek active video element cleanly to a target timestamp
+  const seekVideoTo = (seconds: number) => {
+    const target = Math.max(0, seconds);
+    const yt = ytPlayerRef.current;
+    if (yt && ytReadyRef.current) {
+      try {
+        const ytDur = yt.getDuration();
+        const safeSec = ytDur > 0 ? Math.min(ytDur - 0.1, target) : target;
+        yt.seekTo(safeSec, true);
+      } catch {
+        // Ignore
+      }
+    }
+
+    const vid = htmlVideoRef.current;
+    if (vid && Number.isFinite(vid.duration) && vid.duration > 0) {
+      vid.currentTime = Math.min(vid.duration - 0.05, target);
+    } else if (vid) {
+      vid.currentTime = target;
+    }
+  };
 
   // High-resolution waveform peaks (1200 buckets for crisp scrolling waveform)
   const peaks = useMemo(() => {
@@ -102,12 +352,40 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
     return result;
   }, [audioBuffer]);
 
-  // Animation loop: renders scrolling tape waveform underneath center playhead + overview bar
+  // Animation loop: renders scrolling tape waveform + syncs A/B loop wrapping with video
   useEffect(() => {
     let rafId: number;
+    let lastLoopSyncAt = 0;
 
     const renderFrame = () => {
       rafId = requestAnimationFrame(renderFrame);
+
+      // Keep video and tape engine locked on A/B loop boundaries
+      if (isPlaying && !isScratching && !fx.reverse) {
+        const nowMs = performance.now();
+        const vid = htmlVideoRef.current;
+        if (vid && !vid.paused && vid.readyState >= 2) {
+          if (loop.enabled && vid.currentTime >= loop.end) {
+            vid.currentTime = loop.start;
+            audioEngine.seek(loop.start);
+          } else {
+            // Keep tape waveform synced within tape buffer duration (wrapping cleanly modulo buffer length for longer videos)
+            const tapeDur = audioEngine.getDuration() || 22;
+            audioEngine.syncTimeFromVideo(vid.currentTime % tapeDur);
+          }
+        } else if (ytPlayerRef.current && ytReadyRef.current && nowMs - lastLoopSyncAt > 180) {
+          lastLoopSyncAt = nowMs;
+          try {
+            const ytCur = ytPlayerRef.current.getCurrentTime();
+            if (loop.enabled && ytCur >= loop.end) {
+              ytPlayerRef.current.seekTo(loop.start, true);
+              audioEngine.seek(loop.start);
+            }
+          } catch {
+            // Ignore
+          }
+        }
+      }
 
       const curTime = audioEngine.getCurrentTime();
       const duration = audioEngine.getDuration() || quote.duration || 22;
@@ -129,7 +407,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
           ctx.fillStyle = '#0c0e13';
           ctx.fillRect(0, 0, w, h);
 
-          // Subtle 1-second ruler ticks scrolling with tape
           const startSec = curTime - WINDOW_SECONDS / 2;
           const endSec = curTime + WINDOW_SECONDS / 2;
           const firstTick = Math.floor(startSec);
@@ -152,14 +429,12 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
             }
           }
 
-          // Center horizon line
           ctx.strokeStyle = '#1a1d27';
           ctx.beginPath();
           ctx.moveTo(0, h / 2);
           ctx.lineTo(w, h / 2);
           ctx.stroke();
 
-          // Loop region highlight scrolling with tape
           if (loop.enabled) {
             const loopX1 = centerX + (loop.start - curTime) * pxPerSec;
             const loopX2 = centerX + (loop.end - curTime) * pxPerSec;
@@ -181,7 +456,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
             ctx.fillText('OUT', Math.max(loopX1 + 22, loopX2 - 24), h - 8);
           }
 
-          // Draw waveform bars passing underneath center playhead
           if (peaks.length > 0) {
             const bucketDur = duration / peaks.length;
             const barPxWidth = Math.max(2, bucketDur * pxPerSec - 1);
@@ -210,7 +484,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
             }
           }
 
-          // Stationary Center Tape Head Needle
           ctx.strokeStyle = isScratching ? '#ffffff' : '#f59e0b';
           ctx.lineWidth = 2;
           ctx.beginPath();
@@ -218,7 +491,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
           ctx.lineTo(centerX, h);
           ctx.stroke();
 
-          // Needle cap triangle
           ctx.fillStyle = isScratching ? '#ffffff' : '#f59e0b';
           ctx.beginPath();
           ctx.moveTo(centerX - 6, 0);
@@ -259,7 +531,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
             }
           }
 
-          // Overview playhead
           const px = (curTime / duration) * w;
           ctx.fillStyle = '#f59e0b';
           ctx.fillRect(px - 1, 0, 2, h);
@@ -269,7 +540,7 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
 
     rafId = requestAnimationFrame(renderFrame);
     return () => cancelAnimationFrame(rafId);
-  }, [peaks, quote.duration, loop, isScratching]);
+  }, [peaks, quote.duration, loop, isScratching, isPlaying, fx.reverse]);
 
   // --- HOLD & SCRATCH HANDLERS ON SCROLLING TAPE ---
   const handleTapePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -277,7 +548,7 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
     try {
       target.setPointerCapture(e.pointerId);
     } catch {
-      // Ignore if synthetic pointerId cannot be captured
+      // Ignore synthetic pointer errors
     }
     dragStateRef.current = {
       active: true,
@@ -302,7 +573,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
     dragStateRef.current.lastX = e.clientX;
     dragStateRef.current.lastTimeMs = now;
 
-    // Pulling tape left (dx < 0) advances audio forward; pulling right (dx > 0) scratches backward
     const deltaSeconds = -(dx / rect.width) * WINDOW_SECONDS;
     const nextTime = audioEngine.getCurrentTime() + deltaSeconds;
     audioEngine.seek(nextTime);
@@ -319,6 +589,7 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
     }
     setIsScratching(false);
     audioEngine.endScratch();
+    seekVideoTo(audioEngine.getCurrentTime());
   };
 
   // --- OVERVIEW SCRUB CLICK ---
@@ -326,8 +597,15 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
     const rect = e.currentTarget.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     const dur = audioEngine.getDuration() || quote.duration;
-    audioEngine.seek(ratio * dur);
+    const targetTime = ratio * dur;
+    audioEngine.seek(targetTime);
+    seekVideoTo(targetTime);
     void audioEngine.resume();
+  };
+
+  const handleStopAll = () => {
+    onStop();
+    seekVideoTo(loop.enabled ? loop.start : 0);
   };
 
   // --- LOOP CONTROLS ---
@@ -384,7 +662,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
       {/* Top Instrument Header */}
       <div className="px-5 py-4 border-b border-zinc-800/80 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="space-y-1 min-w-0">
-          {/* Unboxed typographic metadata */}
           <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400">
             <span className="text-amber-400 font-medium">{quote.category}</span>
             <span aria-hidden="true">·</span>
@@ -401,20 +678,6 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
 
         {/* Workspace Actions */}
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {quote.youtubeId && (
-            <button
-              onClick={() => setShowVideo(!showVideo)}
-              className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                showVideo
-                  ? 'bg-zinc-100 text-zinc-900 border-zinc-100'
-                  : 'bg-[#1a1e29] text-zinc-300 border-zinc-700/70 hover:text-white'
-              }`}
-            >
-              <Youtube className="w-3.5 h-3.5" />
-              <span>{showVideo ? 'Hide Video' : 'Watch Video'}</span>
-            </button>
-          )}
-
           <a
             href={quote.sourceUrl}
             target="_blank"
@@ -467,59 +730,167 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
         </div>
       </div>
 
-      {/* Optional Embedded YouTube Source Frame */}
-      {showVideo && quote.youtubeId && (
-        <div className="border-b border-zinc-800/80 bg-black p-4 flex justify-center">
-          <div className="w-full max-w-2xl aspect-video rounded-lg overflow-hidden border border-zinc-800">
-            <iframe
-              src={`https://www.youtube-nocookie.com/embed/${quote.youtubeId}?rel=0`}
-              title={quote.title}
-              className="w-full h-full"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-              allowFullScreen
-            />
-          </div>
-        </div>
-      )}
+      {/* Deck Body + Side Master Volume Fader */}
+      <div className="flex flex-col lg:flex-row items-stretch">
+        <div className="flex-1 min-w-0">
+          {/* Balanced 2-Column Video Monitor & Quote Stage (Always Visible) */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 items-stretch border-b border-zinc-800/80">
+            {/* Left: Actual Video Monitor */}
+            <div className="lg:col-span-7 bg-[#090b0f] border-b lg:border-b-0 lg:border-r border-zinc-800/80 flex flex-col justify-between">
+              <div className="relative w-full aspect-video bg-black overflow-hidden">
+                {hasYouTube && (
+                  <div ref={ytContainerRef} className="w-full h-full" />
+                )}
 
-      {/* FM-1 Tape Reels & Timecode Readout Bar */}
-      <div className="px-5 py-3 bg-[#0f1118] border-b border-zinc-800/80 flex flex-wrap items-center justify-between gap-4">
-        {/* Dual Tape Reels */}
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            {[0, 1].map((reelIdx) => (
-              <div
-                key={reelIdx}
-                className={`w-7 h-7 rounded-full border border-zinc-700 bg-[#161922] flex items-center justify-center ${
-                  isPlaying || isScratching
-                    ? displayVel < 0
-                      ? 'animate-reel-reverse'
-                      : 'animate-reel'
-                    : 'paused'
-                }`}
-              >
-                <div className="w-2 h-2 rounded-full bg-zinc-400" />
+                {!hasYouTube && hasDirectVideo && quote.videoUrl && (
+                  <video
+                    ref={htmlVideoRef}
+                    key={quote.videoUrl}
+                    src={quote.videoUrl}
+                    playsInline
+                    preload="metadata"
+                    onClick={onTogglePlay}
+                    onLoadedMetadata={(e) => {
+                      setVideoBuffering(false);
+                      e.currentTarget.volume = Math.max(0, Math.min(1, volume));
+                      const d = e.currentTarget.duration;
+                      if (Number.isFinite(d) && d > 1) setVideoNaturalDuration(d);
+                    }}
+                onCanPlay={() => setVideoBuffering(false)}
+                onWaiting={() => setVideoBuffering(true)}
+                onPlaying={() => setVideoBuffering(false)}
+                onError={() => {
+                  setVideoBuffering(false);
+                  setVideoLoadFailed(true);
+                }}
+                className="w-full h-full object-contain bg-black cursor-pointer"
+              />
+            )}
+
+            {!hasYouTube && hasArchiveEmbed && quote.archiveId && (
+              <iframe
+                key={quote.archiveId}
+                src={`https://archive.org/embed/${encodeURIComponent(quote.archiveId)}`}
+                title={quote.title}
+                className="w-full h-full border-0"
+                allowFullScreen
+                onLoad={() => setVideoBuffering(false)}
+              />
+            )}
+
+            {!hasAnyVideo && (
+              <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-zinc-500 p-6 text-center">
+                <Film className="w-7 h-7 text-zinc-600" />
+                <p className="text-xs font-mono text-zinc-400">
+                  Local Audio Tape Loaded — Ready for Waveform Scrubbing & DSP
+                </p>
               </div>
-            ))}
+            )}
+
+            {videoBuffering && hasAnyVideo && (
+              <div className="absolute inset-0 pointer-events-none flex items-center justify-center bg-black/35">
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#13161e]/90 border border-zinc-800 text-xs font-mono text-zinc-200">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                  <span>Loading video stream...</span>
+                </div>
+              </div>
+            )}
           </div>
 
-          <div className="font-mono text-xs sm:text-sm text-zinc-200 tracking-tight">
-            <span>{formatTime(displayTime)}</span>
-            <span className="text-zinc-600 mx-1.5">/</span>
-            <span className="text-zinc-400">{formatTime(duration)}</span>
+          {/* Slim Video Audio Mode Strip */}
+          <div className="px-4 py-2.5 bg-[#0e1017] border-t border-zinc-800/80 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 font-mono text-zinc-400">
+              <Film className="w-3.5 h-3.5 text-amber-400" />
+              <span>
+                {hasYouTube
+                  ? 'YouTube Video Synced'
+                  : hasDirectVideo
+                    ? 'Internet Archive Video Stream'
+                    : hasArchiveEmbed
+                      ? 'Internet Archive Embed'
+                      : 'Local Tape Audio'}
+              </span>
+              {videoNaturalDuration > 0 && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{formatTime(videoNaturalDuration)} clip</span>
+                </>
+              )}
+            </div>
+
+            {hasAnyVideo && !hasArchiveEmbed && (
+              <button
+                onClick={() => setVideoAudioEnabled(!videoAudioEnabled)}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md font-mono text-[11px] border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  videoAudioEnabled
+                    ? 'bg-[#1a1e29] border-zinc-700/70 text-zinc-200 hover:text-white'
+                    : 'bg-amber-500/15 border-amber-500/60 text-amber-300'
+                }`}
+                title="Switch between original video audio and FM-1 Tape FX solo layer"
+              >
+                {videoAudioEnabled ? (
+                  <Volume2 className="w-3.5 h-3.5 text-amber-400" />
+                ) : (
+                  <VolumeX className="w-3.5 h-3.5 text-amber-400" />
+                )}
+                <span>{videoAudioEnabled ? 'Video Audio' : 'Tape FX Solo'}</span>
+              </button>
+            )}
           </div>
         </div>
 
-        {/* Speed / Scratch Mode Indicator */}
-        <div className="flex items-center gap-4 font-mono text-xs">
-          {loop.enabled && (
-            <span className="text-amber-400">
-              LOOP {formatTime(loop.start)} – {formatTime(loop.end)}
-            </span>
-          )}
-          <span className={isScratching ? 'text-white font-semibold' : 'text-zinc-400'}>
-            {speedLabel}
-          </span>
+        {/* Right: Editorial Quote Transcript, Context & Tape Telemetry */}
+        <div className="lg:col-span-5 p-5 flex flex-col justify-between gap-5 bg-[#13161e]">
+          <div className="space-y-4">
+            <div className="flex items-center justify-between text-[11px] font-mono text-zinc-500">
+              <span>QUOTE TRANSCRIPT</span>
+              <span>{quote.tags.slice(0, 3).join(' · ')}</span>
+            </div>
+
+            <blockquote className="font-quote italic text-base sm:text-lg text-zinc-100 leading-relaxed">
+              “{quote.quoteText}”
+            </blockquote>
+
+            <p className="text-xs text-zinc-400 leading-relaxed">{quote.context}</p>
+          </div>
+
+          {/* Tape Telemetry & Dual Reels */}
+          <div className="pt-4 border-t border-zinc-800/80 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-1.5">
+                {[0, 1].map((reelIdx) => (
+                  <div
+                    key={reelIdx}
+                    className={`w-7 h-7 rounded-full border border-zinc-700 bg-[#161922] flex items-center justify-center ${
+                      isPlaying || isScratching
+                        ? displayVel < 0
+                          ? 'animate-reel-reverse'
+                          : 'animate-reel'
+                        : 'paused'
+                    }`}
+                  >
+                    <div className="w-2 h-2 rounded-full bg-zinc-400" />
+                  </div>
+                ))}
+              </div>
+              <div className="font-mono text-xs text-zinc-200">
+                <span>{formatTime(displayTime)}</span>
+                <span className="text-zinc-600 mx-1">/</span>
+                <span className="text-zinc-400">{formatTime(duration)}</span>
+              </div>
+            </div>
+
+            <div className="text-right font-mono text-xs">
+              <div className={isScratching ? 'text-white font-semibold' : 'text-zinc-400'}>
+                {speedLabel}
+              </div>
+              {loop.enabled && (
+                <div className="text-[11px] text-amber-400">
+                  LOOP {formatTime(loop.start)} – {formatTime(loop.end)}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -528,12 +899,12 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
         <canvas
           ref={tapeCanvasRef}
           width={1120}
-          height={164}
+          height={156}
           onPointerDown={handleTapePointerDown}
           onPointerMove={handleTapePointerMove}
           onPointerUp={handleTapePointerUp}
           onPointerCancel={handleTapePointerUp}
-          className={`w-full h-40 block touch-none ${isScratching ? 'cursor-grabbing' : 'cursor-grab'}`}
+          className={`w-full h-36 sm:h-40 block touch-none ${isScratching ? 'cursor-grabbing' : 'cursor-grab'}`}
         />
         <div className="absolute top-2.5 right-3 pointer-events-none text-[11px] font-mono text-zinc-500">
           {isScratching ? 'Scratching Tape' : 'Hold & drag waveform to scratch'}
@@ -548,13 +919,13 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
           height={28}
           onClick={handleOverviewSeek}
           className="w-full h-7 block cursor-pointer"
-          title="Click anywhere to jump in the quote"
+          title="Click anywhere to jump in the quote & video"
         />
       </div>
 
       {/* Transport & Looping Control Strip */}
-      <div className="px-5 py-3.5 border-b border-zinc-800/80 flex flex-wrap items-center justify-between gap-4 bg-[#11141c]">
-        {/* Left: Tape Transport */}
+      <div className="px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 bg-[#11141c]">
+        {/* Left: Tape & Video Transport */}
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={onTogglePlay}
@@ -565,7 +936,7 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
           </button>
 
           <button
-            onClick={onStop}
+            onClick={handleStopAll}
             className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-[#1a1e29] hover:bg-zinc-800 text-zinc-200 border border-zinc-700/70 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Square className="w-3.5 h-3.5" />
@@ -647,23 +1018,14 @@ export const TapeDeck: React.FC<TapeDeckProps> = ({
           </button>
         </div>
       </div>
-
-      {/* Quote Transcript & Context (spacious editorial presentation, no thick left border) */}
-      <div className="px-5 py-5 space-y-3">
-        <blockquote className="font-quote italic text-base sm:text-lg text-zinc-100 leading-relaxed max-w-4xl">
-          “{quote.quoteText}”
-        </blockquote>
-        <div className="flex flex-wrap items-center justify-between gap-4 pt-1 text-xs text-zinc-400">
-          <p className="max-w-3xl leading-relaxed">{quote.context}</p>
-          <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-zinc-500">
-            {quote.tags.map((tag, idx) => (
-              <React.Fragment key={tag}>
-                <span>{tag}</span>
-                {idx < quote.tags.length - 1 && <span aria-hidden="true">·</span>}
-              </React.Fragment>
-            ))}
-          </div>
         </div>
+
+        {/* Big Side Master Volume Fader */}
+        <VolumeFader
+          volume={volume}
+          onChangeVolume={onChangeVolume}
+          isPlaying={isPlaying}
+        />
       </div>
     </section>
   );

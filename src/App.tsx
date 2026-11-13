@@ -15,10 +15,12 @@ import { INITIAL_QUOTES } from './data/quotes';
 import {
   AudioFXState,
   LoopState,
+  QuoteCategory,
   QuoteItem,
   QuoteSourcePlatform,
 } from './types';
 import { audioEngine } from './utils/audioEngine';
+import { fetchArchiveVideoQuotes, resolveArchiveMediaUrls } from './utils/archiveFetcher';
 
 const DEFAULT_FX: AudioFXState = {
   speed: 1.0,
@@ -49,6 +51,11 @@ export default function App() {
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
 
+  // Live Archive.org Video Fetch state
+  const [isFetchingArchive, setIsFetchingArchive] = useState<boolean>(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [fetchStatus, setFetchStatus] = useState<string | null>(null);
+
   // Tape Loop & Effects
   const [loop, setLoop] = useState<LoopState>({
     enabled: false,
@@ -56,6 +63,7 @@ export default function App() {
     end: 8,
   });
   const [fx, setFx] = useState<AudioFXState>(DEFAULT_FX);
+  const [volume, setVolume] = useState<number>(0.85);
 
   // Saved Quotes
   const [savedIds, setSavedIds] = useState<string[]>(() => {
@@ -82,14 +90,34 @@ export default function App() {
     audioEngine.setLoop(loop);
   }, [loop]);
 
-  // Load quote audio onto tape deck
+  // Sync master volume to engine
+  useEffect(() => {
+    audioEngine.setVolume(volume);
+  }, [volume]);
+
+  // Load quote video & waveform audio buffer onto tape deck
   const loadQuote = useCallback(async (quote: QuoteItem, autoPlay: boolean = false) => {
     try {
       audioEngine.pause();
-      setCurrentQuote(quote);
       setIsPlaying(false);
 
-      const dur = quote.duration || 22;
+      let enrichedQuote = quote;
+      if (quote.archiveId && !quote.videoUrl) {
+        setCurrentQuote(quote);
+        const resolved = await resolveArchiveMediaUrls(quote.archiveId);
+        if (resolved.videoUrl) {
+          enrichedQuote = {
+            ...quote,
+            videoUrl: resolved.videoUrl,
+            duration: resolved.duration ? Math.min(180, resolved.duration) : quote.duration,
+          };
+          setQuotes((prev) => prev.map((q) => (q.id === quote.id ? enrichedQuote : q)));
+        }
+      }
+
+      setCurrentQuote(enrichedQuote);
+
+      const dur = enrichedQuote.duration || 22;
       const defaultLoop: LoopState = {
         enabled: false,
         start: Number((dur * 0.15).toFixed(2)),
@@ -98,7 +126,7 @@ export default function App() {
       setLoop(defaultLoop);
       audioEngine.setLoop(defaultLoop);
 
-      const buffer = await audioEngine.loadQuoteAudio(quote);
+      const buffer = await audioEngine.loadQuoteAudio(enrichedQuote);
       setAudioBuffer(buffer);
       audioEngine.seek(0);
 
@@ -123,6 +151,47 @@ export default function App() {
     }
     loadQuote(initial, false);
   }, [loadQuote]);
+
+  // Fetch live video quote samples from Internet Archive
+  const handleFetchArchiveQuotes = async (
+    query: string,
+    category: Exclude<QuoteCategory, 'All Quotes'>
+  ) => {
+    setIsFetchingArchive(true);
+    setFetchError(null);
+    setFetchStatus(null);
+
+    try {
+      const fetched = await fetchArchiveVideoQuotes(query, category, 6);
+      if (fetched.length === 0) {
+        setFetchError(`No MPEG4 video samples found on Internet Archive for "${query}".`);
+        return;
+      }
+
+      setQuotes((prev) => {
+        const existingIds = new Set(prev.map((q) => q.id));
+        const novel = fetched.filter((q) => !existingIds.has(q.id));
+        return [...novel, ...prev];
+      });
+
+      setActiveNav(category);
+      setSourceFilter('All');
+      setSelectedTag(null);
+      setFetchStatus(`Loaded ${fetched.length} live video samples from Internet Archive.`);
+
+      // Load the first fetched video directly onto the Tape Deck
+      window.location.hash = `quote/${fetched[0].slug}`;
+      await loadQuote(fetched[0], false);
+    } catch (err) {
+      setFetchError(
+        err instanceof Error
+          ? `Could not fetch Internet Archive videos: ${err.message}`
+          : 'Could not reach Internet Archive search API.'
+      );
+    } finally {
+      setIsFetchingArchive(false);
+    }
+  };
 
   // Extract all unique tags across archive
   const allTags = useMemo(() => {
@@ -241,7 +310,7 @@ export default function App() {
       />
 
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
-        {/* Tape Deck with Scrolling Waveform & Hold-to-Scratch */}
+        {/* Video & FM-1 Tape Deck with Scrolling Waveform & Hold-to-Scratch */}
         <TapeDeck
           quote={currentQuote}
           audioBuffer={audioBuffer}
@@ -258,6 +327,8 @@ export default function App() {
           isRecording={isRecording}
           onToggleRecord={handleToggleRecord}
           onOpenImport={() => setIsImportOpen(true)}
+          volume={volume}
+          onChangeVolume={setVolume}
         />
 
         {/* FM-1 Style Effects & Processing Rack */}
@@ -267,7 +338,7 @@ export default function App() {
           onResetFX={handleResetFX}
         />
 
-        {/* Quote Archive Browser (Political, Historical, Movie, YouTube & Internet Archive + Tags) */}
+        {/* Quote Video Archive Browser + Live Archive.org Video Fetcher */}
         <QuoteBrowser
           quotes={quotes}
           filteredQuotes={filteredQuotes}
@@ -289,12 +360,16 @@ export default function App() {
             loadQuote(q, autoPlay);
           }}
           onRandomFiltered={handleRandomFiltered}
+          onFetchArchiveQuotes={handleFetchArchiveQuotes}
+          isFetchingArchive={isFetchingArchive}
+          fetchError={fetchError}
+          fetchStatus={fetchStatus}
         />
       </main>
 
       <footer className="border-t border-zinc-800/80 py-5 px-4 sm:px-6 mt-8">
         <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-zinc-500">
-          <span>Lost Quotes — Archival Tape & Quote Sampler</span>
+          <span>Lost Quotes — FM-1 Video & Archival Quote Sampler</span>
           <button
             onClick={() => setIsGithubOpen(true)}
             className="hover:text-zinc-200 transition-colors cursor-pointer"

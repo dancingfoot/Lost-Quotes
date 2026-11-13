@@ -1,5 +1,6 @@
 {
   "name": "lost-quotes",
+  "description": "FM-1 inspired video and tape quote sampler for watching, fetching, looping, scratching, and processing political, historical, and movie quotes from YouTube and Internet Archive.",
   "private": true,
   "version": "0.0.0",
   "type": "module",

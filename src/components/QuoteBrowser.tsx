@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Search,
   Shuffle,
@@ -6,6 +6,9 @@ import {
   Play,
   Youtube,
   Archive,
+  Globe,
+  Loader2,
+  AlertCircle,
 } from 'lucide-react';
 import { QuoteCategory, QuoteItem, QuoteSourcePlatform } from '../types';
 import { QUOTE_CATEGORIES } from '../data/quotes';
@@ -29,7 +32,41 @@ interface QuoteBrowserProps {
   onToggleSave: (id: string) => void;
   onSelectQuote: (quote: QuoteItem, autoPlay?: boolean) => void;
   onRandomFiltered: () => void;
+  onFetchArchiveQuotes: (
+    query: string,
+    category: Exclude<QuoteCategory, 'All Quotes'>
+  ) => Promise<void>;
+  isFetchingArchive: boolean;
+  fetchError: string | null;
+  fetchStatus: string | null;
 }
+
+const ARCHIVE_PRESETS: Array<{
+  label: string;
+  query: string;
+  category: Exclude<QuoteCategory, 'All Quotes'>;
+}> = [
+  {
+    label: 'Political Speeches',
+    query: 'presidential speech OR inauguration OR address',
+    category: 'Political Quotes',
+  },
+  {
+    label: 'Historical Newsreels',
+    query: 'newsreel OR "universal newsreel" OR history speech',
+    category: 'Historical Quotes',
+  },
+  {
+    label: 'NASA & Space',
+    query: 'NASA Apollo moon mission audio speech',
+    category: 'Historical Quotes',
+  },
+  {
+    label: 'Classic Cinema',
+    query: 'public domain classic film monologue drama',
+    category: 'Movie Quotes',
+  },
+];
 
 export const QuoteBrowser: React.FC<QuoteBrowserProps> = ({
   filteredQuotes,
@@ -48,20 +85,107 @@ export const QuoteBrowser: React.FC<QuoteBrowserProps> = ({
   onToggleSave,
   onSelectQuote,
   onRandomFiltered,
+  onFetchArchiveQuotes,
+  isFetchingArchive,
+  fetchError,
+  fetchStatus,
 }) => {
+  const [liveQuery, setLiveQuery] = useState('');
+  const [liveCategory, setLiveCategory] =
+    useState<Exclude<QuoteCategory, 'All Quotes'>>('Political Quotes');
+
+  const handleLiveFetchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetQuery = liveQuery.trim() || searchQuery.trim() || 'presidential speech';
+    void onFetchArchiveQuotes(targetQuery, liveCategory);
+  };
+
   return (
     <section className="space-y-5">
-      {/* Filter Toolbar */}
+      {/* Filter & Live Video Fetch Toolbar */}
       <div className="bg-[#13161e] border border-zinc-800/90 rounded-xl p-4 sm:p-5 space-y-4">
+        {/* Live Internet Archive Video Fetcher */}
+        <div className="pb-4 border-b border-zinc-800/80 space-y-3">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Globe className="w-4 h-4 text-amber-400 shrink-0" />
+              <h2 className="text-xs font-semibold text-white uppercase tracking-wider">
+                Fetch Live Video Samples (Internet Archive)
+              </h2>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {ARCHIVE_PRESETS.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  disabled={isFetchingArchive}
+                  onClick={() => {
+                    setLiveCategory(preset.category);
+                    void onFetchArchiveQuotes(preset.query, preset.category);
+                  }}
+                  className="px-2.5 py-1 rounded-md text-[11px] font-mono bg-[#0c0e13] hover:bg-[#1a1e29] text-zinc-300 hover:text-amber-300 border border-zinc-800 transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 cursor-pointer"
+                >
+                  + {preset.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <form onSubmit={handleLiveFetchSubmit} className="flex flex-col sm:flex-row gap-2">
+            <input
+              type="text"
+              value={liveQuery}
+              onChange={(e) => setLiveQuery(e.target.value)}
+              placeholder="Fetch real MP4 video clips from Archive.org (e.g. 'Civil Rights', 'Einstein', 'Apollo')..."
+              className="flex-1 px-3.5 py-2 bg-[#0c0e13] border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-amber-500"
+            />
+            <select
+              value={liveCategory}
+              onChange={(e) =>
+                setLiveCategory(e.target.value as Exclude<QuoteCategory, 'All Quotes'>)
+              }
+              className="px-3 py-2 bg-[#0c0e13] border border-zinc-800 rounded-lg text-xs text-zinc-200 focus:outline-none focus:border-amber-500"
+            >
+              <option value="Political Quotes">Political Quotes</option>
+              <option value="Historical Quotes">Historical Quotes</option>
+              <option value="Movie Quotes">Movie Quotes</option>
+            </select>
+            <button
+              type="submit"
+              disabled={isFetchingArchive}
+              className="flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-black transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {isFetchingArchive ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Archive className="w-3.5 h-3.5" />
+              )}
+              <span>{isFetchingArchive ? 'Fetching...' : 'Fetch Videos'}</span>
+            </button>
+          </form>
+
+          {fetchError && (
+            <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+              <span>{fetchError}</span>
+            </div>
+          )}
+
+          {fetchStatus && !fetchError && (
+            <p className="text-xs font-mono text-emerald-400">{fetchStatus}</p>
+          )}
+        </div>
+
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-          {/* Search */}
+          {/* Local Library Search */}
           <div className="relative flex-1">
             <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => onChangeSearch(e.target.value)}
-              placeholder="Search quotes, speakers, films, or archive sources..."
+              placeholder="Filter loaded quotes, speakers, films, or archive sources..."
               className="w-full pl-10 pr-16 py-2.5 bg-[#0c0e13] border border-zinc-800 rounded-lg text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-amber-500 transition-colors"
             />
             {searchQuery && (
@@ -219,7 +343,7 @@ export const QuoteBrowser: React.FC<QuoteBrowserProps> = ({
                     >
                       {quote.title}
                     </h3>
-                    <p className="text-xs text-zinc-400 mt-0.5">{quote.speaker}</p>
+                    <p className="text-xs text-zinc-400 mt-0.5 line-clamp-1">{quote.speaker}</p>
                   </div>
 
                   {/* Quote excerpt */}
@@ -243,7 +367,7 @@ export const QuoteBrowser: React.FC<QuoteBrowserProps> = ({
                     }`}
                   >
                     <Play className="w-3 h-3 fill-current" />
-                    <span>{isCurrent && isPlaying ? 'Playing' : 'Load Tape'}</span>
+                    <span>{isCurrent && isPlaying ? 'Playing' : 'Load Video'}</span>
                   </button>
                 </div>
               </article>
@@ -254,7 +378,7 @@ export const QuoteBrowser: React.FC<QuoteBrowserProps> = ({
         <div className="bg-[#13161e] border border-zinc-800/90 rounded-xl p-12 text-center space-y-3">
           <h4 className="text-sm font-semibold text-zinc-200">No quotes match your current filters</h4>
           <p className="text-xs text-zinc-400 max-w-md mx-auto">
-            Try clearing the tag filter, switching source platforms, or resetting your search query.
+            Try clearing the tag filter, switching source platforms, or fetching live video quotes from Internet Archive.
           </p>
           <button
             onClick={() => {

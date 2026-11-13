@@ -54,6 +54,8 @@ class TapeAudioEngine {
   private lastScratchInputTime: number = 0;
   private isBraking: boolean = false;
   private brakeGain: number = 1.0;
+  private videoAudioActive: boolean = false;
+  private masterVolume: number = 0.85;
 
   // Granular smear state
   private grainPhase: number = 0;
@@ -79,7 +81,7 @@ class TapeAudioEngine {
 
     // Master bus & analyser
     this.masterGain = this.ctx.createGain();
-    this.masterGain.gain.setValueAtTime(0.9, this.ctx.currentTime);
+    this.masterGain.gain.setValueAtTime(this.masterVolume * 0.95, this.ctx.currentTime);
 
     this.analyserNode = this.ctx.createAnalyser();
     this.analyserNode.fftSize = 256;
@@ -297,7 +299,11 @@ class TapeAudioEngine {
         sR = this.crushLastR;
       }
 
-      const gain = this.isBraking ? this.brakeGain : 1.0;
+      // When real video audio is playing forward normally, let the video element carry the main dialogue
+      // while the Web Audio tape buffer takes over immediately on Scratch, Reverse, Brake, or Tape FX Solo mode.
+      const tapeLayerAudible =
+        !this.videoAudioActive || this.isScratching || this.isBraking || this.fx.reverse;
+      const gain = (this.isBraking ? this.brakeGain : 1.0) * (tapeLayerAudible ? 1.0 : 0.0);
       outL[i] = sL * gain;
       outR[i] = sR * gain;
     }
@@ -503,6 +509,19 @@ class TapeAudioEngine {
     this.tapePos = clamped * this.currentBuffer.sampleRate;
   }
 
+  public setVideoAudioActive(active: boolean) {
+    this.videoAudioActive = active;
+  }
+
+  public syncTimeFromVideo(seconds: number) {
+    if (!this.currentBuffer || this.isScratching || this.isBraking || this.fx.reverse) return;
+    const clamped = Math.max(0, Math.min(this.currentBuffer.duration, seconds));
+    const currentSec = this.tapePos / this.currentBuffer.sampleRate;
+    if (Math.abs(clamped - currentSec) > 0.18) {
+      this.tapePos = clamped * this.currentBuffer.sampleRate;
+    }
+  }
+
   public getCurrentTime(): number {
     if (!this.currentBuffer) return 0;
     return this.tapePos / this.currentBuffer.sampleRate;
@@ -578,6 +597,18 @@ class TapeAudioEngine {
     if (this.dustGain) {
       this.dustGain.gain.setTargetAtTime(newFX.tapeDust * 0.4, now, 0.05);
     }
+  }
+
+  public setVolume(volume: number) {
+    const clamped = Math.max(0, Math.min(1, volume));
+    this.masterVolume = clamped;
+    if (this.ctx && this.masterGain) {
+      this.masterGain.gain.setTargetAtTime(clamped * 0.95, this.ctx.currentTime, 0.015);
+    }
+  }
+
+  public getVolume(): number {
+    return this.masterVolume;
   }
 
   // --- LIVE PERFORMANCE RECORDING ---
